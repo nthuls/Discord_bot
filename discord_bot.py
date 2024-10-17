@@ -88,15 +88,18 @@ last_message_ids = load_last_message_ids()
 # Database connection (PostgreSQL) only if enabled
 if USE_POSTGRESQL:
     def get_db_connection():
-        return psycopg2.connect(
-            host=DB_HOST,
-            dbname=DB_NAME,
-            user=DB_USER,
-            password=DB_PASSWORD
-        )
-else:
-    logging.info("PostgreSQL is disabled")
-    get_db_connection = None
+        try:
+            conn = psycopg2.connect(
+                host=DB_HOST,
+                dbname=DB_NAME,
+                user=DB_USER,
+                password=DB_PASSWORD
+            )
+            logging.info("Successfully connected to the database.")
+            return conn
+        except Exception as e:
+            logging.error(f"Failed to connect to the database: {e}")
+            raise
 
 # OpenSearch client only if enabled
 if USE_OPENSEARCH:
@@ -111,6 +114,25 @@ else:
     logging.info("OpenSearch is disabled")
     opensearch_client = None
 
+def create_table_if_not_exists():
+    create_table_query = '''
+    CREATE TABLE IF NOT EXISTS messages (
+        id BIGINT PRIMARY KEY,
+        channel_id BIGINT,
+        author_id BIGINT,
+        content TEXT,
+        created_at TIMESTAMPTZ,
+        attachments TEXT[]
+    );
+    '''
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(create_table_query)
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+
 # Insert messages into PostgreSQL only if enabled
 def insert_messages_pg(messages):
     if USE_POSTGRESQL and get_db_connection:
@@ -119,8 +141,13 @@ def insert_messages_pg(messages):
             cursor = conn.cursor()
             for message in messages:
                 try:
+                    # Log message details before insertion
+                    logging.info(f"Inserting message ID {message.id}")
+                    logging.debug(f"Message Content: {message.content}")
+                    logging.debug(f"Attachments: {[attachment.url for attachment in message.attachments]}")
+                    
                     cursor.execute("""
-                        INSERT INTO messages (id, channel_id, author_id, content, timestamp, attachments)
+                        INSERT INTO messages (id, channel_id, author_id, content, created_at, attachments)
                         VALUES (%s, %s, %s, %s, %s, %s)
                         ON CONFLICT (id) DO NOTHING;
                     """, (
@@ -131,15 +158,18 @@ def insert_messages_pg(messages):
                         message.created_at,
                         [attachment.url for attachment in message.attachments]
                     ))
+                    conn.commit()  # Commit after each successful insert
+                    logging.info(f"Successfully inserted message ID {message.id}")
                 except Exception as e:
                     logging.error(f'Error inserting message {message.id}: {e}')
-            conn.commit()
+                    conn.rollback()  # Rollback transaction on error
             cursor.close()
             conn.close()
         except Exception as e:
             logging.exception("Error connecting to PostgreSQL")
     else:
         logging.info("PostgreSQL is disabled or unavailable")
+
 
 # Index messages into OpenSearch only if enabled
 def index_messages_os(messages):
@@ -153,7 +183,7 @@ def index_messages_os(messages):
                 'author_name': message.author.name,
                 'content': message.content,
                 'timestamp': message.created_at,
-                'attachments': [attachment.url for attachment in message.attachments]
+                'attachments': [attachment.url for attachment in message.attachments] or []
             }
             try:
                 opensearch_client.index(index='discord_messages', body=doc, id=message.id)
@@ -161,6 +191,7 @@ def index_messages_os(messages):
                 logging.error(f'Error indexing message {message.id}: {e}')
     else:
         logging.info("OpenSearch is disabled or unavailable")
+
 
 # File-based storage function
 def store_messages_file(messages):
@@ -231,6 +262,7 @@ async def on_ready():
 
                     # Process or store messages
                     if USE_POSTGRESQL:
+                        create_table_if_not_exists()
                         insert_messages_pg(messages)
                     if USE_OPENSEARCH:
                         index_messages_os(messages)
