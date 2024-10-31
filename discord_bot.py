@@ -13,6 +13,8 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from influxdb_client import InfluxDBClient, Point, WritePrecision
+from influxdb_client.client.write_api import SYNCHRONOUS
 
 # Load environment variables
 load_dotenv()
@@ -25,6 +27,7 @@ parser.add_argument('--use-postgresql', action='store_true', help='Enable Postgr
 parser.add_argument('--use-opensearch', action='store_true', help='Enable OpenSearch for storage')
 parser.add_argument('--use-opentelemetry', action='store_true', help='Enable OpenTelemetry tracing')
 parser.add_argument('--use-file-storage', action='store_true', help='Enable file-based storage for messages')
+parser.add_argument('--use-influxdb', action='store_true', help='Enable InfluxDB for storage')
 parser.add_argument('--output-file', type=str, help='Specify the output file to save messages', default='messages.json')
 parser.add_argument('--log-file', type=str, help='Specify the log file location', default='message_fetcher.log')
 args = parser.parse_args()
@@ -38,6 +41,7 @@ USE_POSTGRESQL = args.use_postgresql or os.getenv('USE_POSTGRESQL', 'false').low
 USE_OPENSEARCH = args.use_opensearch or os.getenv('USE_OPENSEARCH', 'false').lower() == 'true'
 USE_OPENTELEMETRY = args.use_opentelemetry or os.getenv('USE_OPENTELEMETRY', 'false').lower() == 'true'
 USE_FILE_STORAGE = args.use_file_storage or os.getenv('USE_FILE_STORAGE', 'false').lower() == 'true'
+USE_INFLUXDB = args.use_influxdb or os.getenv('USE_INFLUXDB', 'false').lower() == 'true'
 
 DB_HOST = os.getenv('DB_HOST', 'localhost')
 DB_NAME = os.getenv('DB_NAME', 'discord_messages')
@@ -46,6 +50,12 @@ DB_PASSWORD = os.getenv('DB_PASSWORD', 'your_db_password')
 
 OPENSEARCH_HOST = os.getenv('OPENSEARCH_HOST', 'localhost')
 OPENSEARCH_PORT = int(os.getenv('OPENSEARCH_PORT', 9200))
+
+# Adjusted InfluxDB URL to use localhost as per your note
+INFLUXDB_URL = os.getenv('INFLUXDB_URL', 'http://localhost:8086')
+INFLUXDB_TOKEN = os.getenv('INFLUXDB_TOKEN', 'your_influxdb_token')
+INFLUXDB_ORG = os.getenv('INFLUXDB_ORG', 'your_organization')
+INFLUXDB_BUCKET = os.getenv('INFLUXDB_BUCKET', 'discord_metrics')
 
 LAST_MESSAGE_ID_FILE = 'last_message_ids.json'
 
@@ -88,18 +98,15 @@ last_message_ids = load_last_message_ids()
 # Database connection (PostgreSQL) only if enabled
 if USE_POSTGRESQL:
     def get_db_connection():
-        try:
-            conn = psycopg2.connect(
-                host=DB_HOST,
-                dbname=DB_NAME,
-                user=DB_USER,
-                password=DB_PASSWORD
-            )
-            logging.info("Successfully connected to the database.")
-            return conn
-        except Exception as e:
-            logging.error(f"Failed to connect to the database: {e}")
-            raise
+        return psycopg2.connect(
+            host=DB_HOST,
+            dbname=DB_NAME,
+            user=DB_USER,
+            password=DB_PASSWORD
+        )
+else:
+    logging.info("PostgreSQL is disabled")
+    get_db_connection = None
 
 # OpenSearch client only if enabled
 if USE_OPENSEARCH:
@@ -114,24 +121,12 @@ else:
     logging.info("OpenSearch is disabled")
     opensearch_client = None
 
-def create_table_if_not_exists():
-    create_table_query = '''
-    CREATE TABLE IF NOT EXISTS messages (
-        id BIGINT PRIMARY KEY,
-        channel_id BIGINT,
-        author_id BIGINT,
-        content TEXT,
-        created_at TIMESTAMPTZ,
-        attachments TEXT[]
-    );
-    '''
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute(create_table_query)
-    conn.commit()
-    cursor.close()
-    conn.close()
-
+# InfluxDB client only if enabled
+if USE_INFLUXDB:
+    influx_client = InfluxDBClient(url=INFLUXDB_URL, token=INFLUXDB_TOKEN, org=INFLUXDB_ORG)
+else:
+    logging.info("InfluxDB is disabled")
+    influx_client = None
 
 # Insert messages into PostgreSQL only if enabled
 def insert_messages_pg(messages):
@@ -141,13 +136,8 @@ def insert_messages_pg(messages):
             cursor = conn.cursor()
             for message in messages:
                 try:
-                    # Log message details before insertion
-                    logging.info(f"Inserting message ID {message.id}")
-                    logging.debug(f"Message Content: {message.content}")
-                    logging.debug(f"Attachments: {[attachment.url for attachment in message.attachments]}")
-                    
                     cursor.execute("""
-                        INSERT INTO messages (id, channel_id, author_id, content, created_at, attachments)
+                        INSERT INTO messages (id, channel_id, author_id, content, timestamp, attachments)
                         VALUES (%s, %s, %s, %s, %s, %s)
                         ON CONFLICT (id) DO NOTHING;
                     """, (
@@ -158,18 +148,15 @@ def insert_messages_pg(messages):
                         message.created_at,
                         [attachment.url for attachment in message.attachments]
                     ))
-                    conn.commit()  # Commit after each successful insert
-                    logging.info(f"Successfully inserted message ID {message.id}")
                 except Exception as e:
                     logging.error(f'Error inserting message {message.id}: {e}')
-                    conn.rollback()  # Rollback transaction on error
+            conn.commit()
             cursor.close()
             conn.close()
         except Exception as e:
             logging.exception("Error connecting to PostgreSQL")
     else:
         logging.info("PostgreSQL is disabled or unavailable")
-
 
 # Index messages into OpenSearch only if enabled
 def index_messages_os(messages):
@@ -182,8 +169,8 @@ def index_messages_os(messages):
                 'author_id': message.author.id,
                 'author_name': message.author.name,
                 'content': message.content,
-                'timestamp': message.created_at,
-                'attachments': [attachment.url for attachment in message.attachments] or []
+                'timestamp': message.created_at.isoformat(),
+                'attachments': [attachment.url for attachment in message.attachments]
             }
             try:
                 opensearch_client.index(index='discord_messages', body=doc, id=message.id)
@@ -192,6 +179,42 @@ def index_messages_os(messages):
     else:
         logging.info("OpenSearch is disabled or unavailable")
 
+# Store messages to InfluxDB only if enabled
+def store_messages_influxdb(messages):
+    if USE_INFLUXDB and influx_client:
+        write_api = influx_client.write_api(write_options=SYNCHRONOUS)
+        points = []
+        for message in messages:
+            try:
+                # Ensure timestamp is in UTC and of correct precision
+                timestamp = message.created_at.astimezone(datetime.timezone.utc)
+
+                # Prepare content by escaping special characters
+                content = message.content.encode('unicode_escape').decode('ascii')
+
+                # Create a point with all key-value pairs
+                point = Point("discord_messages_v2") \
+                    .tag("channel_id", str(message.channel.id)) \
+                    .tag("channel_name", message.channel.name) \
+                    .tag("author_id", str(message.author.id)) \
+                    .tag("author_name", message.author.name) \
+                    .field("message_id", str(message.id)) \
+                    .field("content", content) \
+                    .field("attachments", json.dumps([attachment.url for attachment in message.attachments])) \
+                    .time(timestamp, WritePrecision.NS)
+
+                points.append(point)
+            except Exception as e:
+                logging.error(f'Error preparing point for message {message.id}: {e}')
+
+        # Write all points in one batch
+        if points:
+            try:
+                write_api.write(bucket=INFLUXDB_BUCKET, org=INFLUXDB_ORG, record=points)
+            except Exception as e:
+                logging.error(f'Error writing points to InfluxDB: {e}')
+    else:
+        logging.info("InfluxDB is disabled or unavailable")
 
 # File-based storage function
 def store_messages_file(messages):
@@ -210,6 +233,7 @@ def store_messages_file(messages):
             f.write('\n')  # Newline after each message
     logging.info(f'Stored {len(messages)} messages in file {args.output_file}')
 
+# Safely fetch channel history while handling exceptions
 async def safe_channel_history(channel, **kwargs):
     messages = []
     while True:
@@ -234,56 +258,56 @@ async def on_ready():
     while True:
         try:
             if USE_OPENTELEMETRY:
-                span = tracer.start_as_current_span("fetch_messages")
+                with tracer.start_as_current_span("fetch_messages"):
+                    await fetch_and_process_messages()
             else:
-                span = None
-
-            for channel_id in CHANNEL_IDS:
-                channel = client.get_channel(channel_id)
-                if channel is None:
-                    logging.warning(f'Cannot find channel with ID {channel_id}')
-                    continue
-
-                logging.info(f'Fetching messages from channel: {channel.name} (ID: {channel_id})')
-                last_message_id = last_message_ids.get(str(channel_id))
-
-                # Fetch new messages since last_message_id
-                messages = await safe_channel_history(
-                    channel,
-                    limit=None,
-                    after=discord.Object(id=last_message_id) if last_message_id else None
-                )
-                logging.info(f'Fetched {len(messages)} new messages from {channel.name}')
-
-                # Process messages if any
-                if messages:
-                    # Update last_message_id
-                    last_message_ids[str(channel_id)] = messages[0].id  # First message is the newest
-
-                    # Process or store messages
-                    if USE_POSTGRESQL:
-                        create_table_if_not_exists()
-                        insert_messages_pg(messages)
-                    if USE_OPENSEARCH:
-                        index_messages_os(messages)
-                    if USE_FILE_STORAGE:
-                        store_messages_file(messages)
-
-                    logging.info(f'Total messages processed for {channel.name}: {len(messages)}')
-                else:
-                    logging.info(f'No new messages in {channel.name}')
-
-                await asyncio.sleep(1)  # Respect rate limits
-
-            # Save last_message_ids
-            save_last_message_ids(last_message_ids)
-            logging.info('Waiting for the next cycle...')
-            await asyncio.sleep(60)  # Wait before checking for new messages
-
-            if span:
-                span.end()
-
+                await fetch_and_process_messages()
         except Exception as e:
             logging.exception("An error occurred during the message fetching process")
 
+async def fetch_and_process_messages():
+    for channel_id in CHANNEL_IDS:
+        channel = client.get_channel(channel_id)
+        if channel is None:
+            logging.warning(f'Cannot find channel with ID {channel_id}')
+            continue
+
+        logging.info(f'Fetching messages from channel: {channel.name} (ID: {channel_id})')
+        last_message_id = last_message_ids.get(str(channel_id))
+
+        # Fetch new messages since last_message_id
+        messages = await safe_channel_history(
+            channel,
+            limit=None,
+            after=discord.Object(id=last_message_id) if last_message_id else None
+        )
+        logging.info(f'Fetched {len(messages)} new messages from {channel.name}')
+
+        # Process messages if any
+        if messages:
+            # Update last_message_id
+            last_message_ids[str(channel_id)] = messages[0].id  # First message is the newest
+
+            # Process or store messages
+            if USE_POSTGRESQL:
+                insert_messages_pg(messages)
+            if USE_OPENSEARCH:
+                index_messages_os(messages)
+            if USE_FILE_STORAGE:
+                store_messages_file(messages)
+            if USE_INFLUXDB:
+                store_messages_influxdb(messages)
+
+            logging.info(f'Total messages processed for {channel.name}: {len(messages)}')
+        else:
+            logging.info(f'No new messages in {channel.name}')
+
+        await asyncio.sleep(1)  # Respect rate limits
+
+    # Save last_message_ids
+    save_last_message_ids(last_message_ids)
+    logging.info('Waiting for the next cycle...')
+    await asyncio.sleep(60)  # Wait before checking for new messages
+
+# Run the Discord bot
 client.run(TOKEN)
