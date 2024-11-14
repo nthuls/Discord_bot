@@ -179,40 +179,33 @@ def index_messages_os(messages):
     else:
         logging.info("OpenSearch is disabled or unavailable")
 
-# Store messages to InfluxDB only if enabled
 def store_messages_influxdb(messages):
     if USE_INFLUXDB and influx_client:
         write_api = influx_client.write_api(write_options=SYNCHRONOUS)
-        points = []
         for message in messages:
             try:
-                # Ensure timestamp is in UTC and of correct precision
-                timestamp = message.created_at.astimezone(datetime.timezone.utc)
+                # Construct the message as a single JSON-like structure
+                message_data = {
+                    "id": message.id,
+                    "channel_id": message.channel.id,
+                    "channel_name": message.channel.name,
+                    "author_id": message.author.id,
+                    "author_name": message.author.name,
+                    "content": message.content,
+                    "timestamp": str(message.created_at),
+                    "attachments": [attachment.url for attachment in message.attachments]
+                }
 
-                # Prepare content by escaping special characters
-                content = message.content.encode('unicode_escape').decode('ascii')
+                # Convert the JSON-like structure into an InfluxDB point
+                point = Point("discord_messages") \
+                    .field("message_data", json.dumps(message_data)) \
+                    .time(message.created_at, WritePrecision.NS)
 
-                # Create a point with all key-value pairs
-                point = Point("discord_messages_v2") \
-                    .tag("channel_id", str(message.channel.id)) \
-                    .tag("channel_name", message.channel.name) \
-                    .tag("author_id", str(message.author.id)) \
-                    .tag("author_name", message.author.name) \
-                    .field("message_id", str(message.id)) \
-                    .field("content", content) \
-                    .field("attachments", json.dumps([attachment.url for attachment in message.attachments])) \
-                    .time(timestamp, WritePrecision.NS)
+                # Write the point to InfluxDB
+                write_api.write(bucket=INFLUXDB_BUCKET, org=INFLUXDB_ORG, record=point)
 
-                points.append(point)
             except Exception as e:
-                logging.error(f'Error preparing point for message {message.id}: {e}')
-
-        # Write all points in one batch
-        if points:
-            try:
-                write_api.write(bucket=INFLUXDB_BUCKET, org=INFLUXDB_ORG, record=points)
-            except Exception as e:
-                logging.error(f'Error writing points to InfluxDB: {e}')
+                logging.error(f'Error writing message {message.id} to InfluxDB: {e}')
     else:
         logging.info("InfluxDB is disabled or unavailable")
 
